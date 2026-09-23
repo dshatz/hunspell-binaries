@@ -1,0 +1,143 @@
+name: Build Hunspell
+
+on:
+  workflow_dispatch:
+    inputs:
+      hunspell_version:
+        description: 'Hunspell Version (e.g. v1.7.2)'
+        required: true
+        default: 'v1.7.2'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }} (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            cmake_args: ""
+          - os: ubuntu-latest
+            target: linux-arm64
+            cmake_args: "-DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64"
+            setup_cmd: "sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu"
+          - os: macos-latest
+            target: macos-universal
+            cmake_args: '-DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"'
+          - os: windows-latest
+            target: windows-x64
+            cmake_args: "-G \"MinGW Makefiles\""
+          - os: macos-latest
+            target: ios-framework
+            cmake_args: "-DCMAKE_SYSTEM_NAME=iOS -DIOS=ON"
+          - os: ubuntu-latest
+            target: wasm
+            cmake_args: ""
+            setup_cmd: "sudo apt-get update && sudo apt-get install -y make && git clone https://github.com/emscripten-core/emsdk.git && cd emsdk && ./emsdk install latest && ./emsdk activate latest && source ./emsdk_env.sh"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run setup commands
+        if: matrix.setup_cmd != ''
+        run: ${{ matrix.setup_cmd }}
+        shell: bash
+
+      - name: Build WebAssembly with Emscripten
+        if: matrix.target == 'wasm'
+        run: |
+          source emsdk/emsdk_env.sh
+          mkdir build && cd build
+          emcmake cmake .. -DHUNSPELL_VERSION=${{ github.event.inputs.hunspell_version }} ${{ matrix.cmake_args }}
+          emmake make
+        shell: bash
+
+      - name: Build standard targets
+        if: matrix.target != 'wasm'
+        run: |
+          mkdir build && cd build
+          cmake .. -DHUNSPELL_VERSION=${{ github.event.inputs.hunspell_version }} ${{ matrix.cmake_args }} -DCMAKE_BUILD_TYPE=Release
+          cmake --build . --config Release -j4
+        shell: bash
+
+      - name: Install artifacts
+        run: |
+          cd build
+          cmake --install . --prefix ../install
+        shell: bash
+
+      - name: Zip Artifacts
+        run: |
+          cd install
+          cmake -E tar cf ../hunspell-${{ matrix.target }}.zip --format=zip .
+        shell: bash
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hunspell-${{ matrix.target }}
+          path: hunspell-${{ matrix.target }}.zip
+
+  build_android:
+    name: Build Android
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26b
+
+      - name: Build Android ABIs
+        run: |
+          ABIS=("armeabi-v7a" "arm64-v8a" "x86" "x86_64")
+          mkdir install
+          for abi in "${ABIS[@]}"; do
+            mkdir build-$abi
+            cd build-$abi
+            cmake .. -DHUNSPELL_VERSION=${{ github.event.inputs.hunspell_version }} \
+              -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+              -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-21 -DCMAKE_BUILD_TYPE=Release
+            cmake --build . --config Release -j4
+            cmake --install . --prefix ../install/$abi
+            cd ..
+          done
+
+      - name: Zip Android Artifacts
+        run: |
+          cd install
+          cmake -E tar cf ../hunspell-android.zip --format=zip .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hunspell-android
+          path: hunspell-android.zip
+
+  release:
+    name: Create Release
+    needs: [build, build_android]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.hunspell_version }}
+          name: Release ${{ github.event.inputs.hunspell_version }}
+          body: "Compiled binaries for Hunspell [${{ github.event.inputs.hunspell_version }}](https://github.com/hunspell/hunspell/releases/tag/${{ github.event.inputs.hunspell_version }})."
+          files: |
+            */*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
